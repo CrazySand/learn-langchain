@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import Body, FastAPI
+from fastapi import Body, FastAPI, Request
 from fastapi.responses import StreamingResponse
 from tabulate import tabulate
 
@@ -289,7 +289,6 @@ def get_user_city() -> str:
     return "广州"
 
 
-
 def build_agent() -> MyAgent:
     """根据环境变量构造 ``MyAgent`` 实例。
 
@@ -321,6 +320,17 @@ async def _lifespan(application: FastAPI):
 app = FastAPI(title="MyAgent API", lifespan=_lifespan)
 
 
+@app.middleware("http")
+async def chat_agent_log_middleware(request: Request, call_next):
+    if not request.url.path.startswith("/chat"):
+        return await call_next(request)
+    response = await call_next(request)
+    agent: MyAgent = request.app.state.agent
+    print(str(agent))
+    print(repr(agent))
+    return response
+
+
 @app.post("/chat/invoke")
 async def http_ainvoke(question: str = Body(..., embed=True, min_length=1)):
     """非流式对话：等待整轮结束后返回完整文本。"""
@@ -328,8 +338,6 @@ async def http_ainvoke(question: str = Body(..., embed=True, min_length=1)):
     lock: asyncio.Lock = app.state.agent_lock
     async with lock:
         content = await agent.ainvoke(question)
-    print(repr(agent))
-    print(str(agent))
     return {"content": content}
 
 
@@ -347,8 +355,7 @@ async def http_astream(question: str = Body(..., embed=True, min_length=1)):
                 )
                 yield f"data: {payload}\n\n"
             yield "data: [DONE]\n\n"
-    print(repr(agent))
-    print(str(agent))
+
     return StreamingResponse(sse_chunks(), media_type="text/event-stream")
 
 
