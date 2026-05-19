@@ -289,6 +289,7 @@ def get_user_city() -> str:
     return "广州"
 
 
+
 def build_agent() -> MyAgent:
     """根据环境变量构造 ``MyAgent`` 实例。
 
