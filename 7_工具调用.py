@@ -1,14 +1,16 @@
-import json
 import os
+import json
 import time
 
+from tabulate import tabulate
 import httpx
-from langchain_core.messages import HumanMessage, ToolMessage
+
+from langchain_deepseek import ChatDeepSeek
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, AIMessageChunk, ToolMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
-from langchain_deepseek import ChatDeepSeek
 
-_HTTP_TIMEOUT = 30.0
+MAX_ROUNDS = 3
 
 
 @tool
@@ -27,7 +29,7 @@ def get_weather(city_name: str) -> str:
             "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0"
         )
     }
-    with httpx.Client(timeout=_HTTP_TIMEOUT, headers=headers) as client:
+    with httpx.Client(timeout=10, headers=headers, verify=False) as client:
         resp = client.get(
             "https://weather.cma.cn/api/autocomplete",
             params={
@@ -56,51 +58,44 @@ def get_user_city() -> str:
 
 
 tools = [get_weather, get_user_city]
-
-tool_map = {
-    tool.name: tool
-    for tool in tools
-}
+tool_map = {tool.name: tool for tool in tools}
 
 
-llm = ChatDeepSeek(
-    model="deepseek-chat",
+llm_with_tools = ChatDeepSeek(
+    model="deepseek-v4-flash",
     base_url="https://api.deepseek.com",
     api_key=os.getenv("DEEPSEEK_API_KEY"),
-)
+    extra_body={"thinking": {"type": "disabled"}},
+).bind_tools(tools)
+
 
 prompt = ChatPromptTemplate.from_messages(
     [
         ("system", "你是{role}，我的好朋友。"),
         MessagesPlaceholder(variable_name="history"),
-        ("human", "{question}"),
+        ("human", "{user_input}"),
     ]
 )
 
-llm_with_tools = llm.bind_tools(tools)
-
-history: list = []
+rounds: list[list[BaseMessage]] = []
 
 while True:
-    user_input = input(">>>").strip()
+    user_input = input("> ").strip()
     if not user_input:
         continue
-    if user_input.lower() in ["quit", "exit"]:
+    if user_input == "exit":
         break
 
     payload = {
         "role": "小云",
-        "history": history,
-        "question": user_input,
+        "history": [msg for r in rounds for msg in r],
+        "user_input": user_input,
     }
-    # request_msgs：每次 stream 发给模型的完整入参（system + 既往 history + 当前 question）；
-    # 工具多跳时同步追加本轮 AIMessage / ToolMessage，仅供当轮请求，不直接写入 history。
     request_msgs = prompt.invoke(payload).to_messages()
-    # generated_msgs：本轮用户问句之后新生成的 AIMessage / ToolMessage（可多条）；
-    # 轮末与 HumanMessage 一并 append 进 history，供下一轮 prompt 的 MessagesPlaceholder 使用。
+    system_msg_content = request_msgs[0].content
     generated_msgs = []
 
-    ai_msg = None
+    ai_msg: AIMessageChunk | None = None
     for chunk in llm_with_tools.stream(request_msgs):
         ai_msg = chunk if ai_msg is None else ai_msg + chunk
         print(chunk.content, end="", flush=True)
@@ -111,15 +106,15 @@ while True:
 
     while ai_msg.tool_calls:
         for call in ai_msg.tool_calls:
-            tool_fn = tool_map[call["name"]]
-            tool_result = tool_fn.invoke(call["args"])
+            tool_func = tool_map[call["name"]]
+            tool_result = tool_func.invoke(call["args"])
             tool_msg = ToolMessage(content=tool_result,
                                    tool_call_id=call["id"])
 
             request_msgs.append(tool_msg)
             generated_msgs.append(tool_msg)
 
-        ai_msg = None
+        ai_msg: AIMessageChunk | None = None
         for chunk in llm_with_tools.stream(request_msgs):
             ai_msg = chunk if ai_msg is None else ai_msg + chunk
             print(chunk.content, end="", flush=True)
@@ -128,10 +123,14 @@ while True:
         request_msgs.append(ai_msg)
         generated_msgs.append(ai_msg)
 
-    history.append(HumanMessage(content=user_input))
-    history.extend(generated_msgs)
+    rounds.append([HumanMessage(content=user_input), *generated_msgs])
 
-    print("=" * 50)
-    for msg in history:
-        print(f"{msg.type}: {msg.content}")
-    print("=" * 50)
+    rounds = rounds[-(MAX_ROUNDS):]
+
+    table: list[list] = [
+        ["system", system_msg_content]
+    ]
+    for r in rounds:
+        for msg in r:
+            table.append([msg.type, msg.content])
+    print(tabulate(table, headers=["角色", "内容"], tablefmt="grid"))
