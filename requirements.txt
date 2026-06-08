@@ -1,0 +1,12 @@
+langchain-core
+langchain-deepseek
+tabulate
+httpx
+fastapi
+uvicorn
+requests
+langchain-community
+langchain-text-splitters
+chromadb
+sentence-transformers
+pypdf
