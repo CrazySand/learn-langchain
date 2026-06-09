@@ -1,16 +1,16 @@
 import os
+from operator import itemgetter
 from pathlib import Path
 
 from tabulate import tabulate
 
 from langchain_deepseek import ChatDeepSeek
-from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessageChunk
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
 
 
-MAX_ROUNDS = 3
 CHROMA_DIR = Path("data/chroma_db")  # 向量库持久化目录
 COLLECTION_NAME = "employee_handbook"  # 集合名
 K = 3  # 检索结果数量
@@ -21,6 +21,30 @@ llm = ChatDeepSeek(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
 )
 
+# 须与建库时（11_rag基本使用.ipynb）使用同一 embedding 模型
+embeddings = HuggingFaceEmbeddings(
+    model_name="BAAI/bge-small-zh-v1.5",
+    model_kwargs={"local_files_only": True},
+)
+
+vectorstore = Chroma(
+    collection_name=COLLECTION_NAME,
+    embedding_function=embeddings,
+    persist_directory=str(CHROMA_DIR),
+)
+
+retriever = vectorstore.as_retriever(search_kwargs={"k": K})
+
+
+prep = {
+    "context": itemgetter("user_input") | retriever | (
+        lambda docs: "\n\n".join(
+            f"【片段 {i+1}】\n{doc.page_content}" for i, doc in enumerate(docs)
+        )
+    ),
+    "history": itemgetter("history"),
+    "user_input": itemgetter("user_input"),
+}
 
 prompt = ChatPromptTemplate.from_messages(
     [
@@ -39,20 +63,7 @@ prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
-embeddings = HuggingFaceEmbeddings(
-    model_name="text-embedding-3-small",
-    model_kwargs={"device": "cpu"},
-)
-
-vectorstore = Chroma(
-    collection_name=COLLECTION_NAME,
-    embedding_function=embeddings,
-    persist_directory=str(CHROMA_DIR),
-)
-
-retriever = vectorstore.as_retriever(search_kwargs={"k": K})
-
-chain = prompt | llm
+chain = prep | prompt | llm
 
 history = []
 
@@ -63,30 +74,20 @@ while True:
     if user_input == "exit":
         break
 
-    context = retriever.invoke(user_input)
-
     payload = {
-        "role": "小云",
         "history": history,
         "user_input": user_input,
-        "context": context,
     }
-    system_msg_content = prompt.invoke(payload).to_messages()[0].content
-    # 等价于：
-    # for chunk in llm.stream(prompt.invoke(history)):
+
+    # 调试
+    table = [[m.type, m.content]
+             for m in (prep | prompt).invoke(payload).to_messages()]
+    print(tabulate(table, headers=["角色", "内容"], tablefmt="grid"))
+
     ai_msg: AIMessageChunk | None = None
     for chunk in chain.stream(payload):
         ai_msg = chunk if ai_msg is None else ai_msg + chunk
         print(chunk.content, end="", flush=True)
     print()
 
-    history.append(HumanMessage(content=user_input))
-    history.append(ai_msg)
-    history = history[-(MAX_ROUNDS * 2):]
-
-    table: list[list] = [
-        ["system", system_msg_content]
-    ]
-    for msg in history:
-        table.append([msg.type, msg.content])
-    print(tabulate(table, headers=["角色", "内容"], tablefmt="grid"))
+    history.extend([HumanMessage(content=user_input), ai_msg])
